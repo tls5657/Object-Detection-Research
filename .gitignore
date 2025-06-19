@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Checkpoints and Data
+checkpoints/
+*.pt
+*.pth
+*.onnx
+bdd100k/
+
+# IDE files & OS files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+
+# Log files
+logs/
+*.log
