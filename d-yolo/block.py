@@ -46,47 +46,65 @@ class ODConv1x1(nn.Module):
             y = Y.reshape(B, Cout, H, W) * spatial_att
         return y.to(out_dtype)
 
-# ---------------------- AFM (paper Eq.(2),(3)) ----------------------
+# [수정] block.py의 AFM 클래스를 아래 코드로 전체 교체
+# ---------------------- AFM (Paper Fig.5 & Eq.(3)) ----------------------
 class AFM(nn.Module):
+    """
+    D-YOLO 논문의 Attention Feature Fusion (AFM) 구현 (Fig. 5)
+    Ff = f_conv1(Fd) * Sig(T) + f_conv2(Fh) * (1 - Sig(T))
+    """
     def __init__(self, channels, r=4, k=3):
         super().__init__()
-        self.pool = nn.AvgPool2d(kernel_size=r, stride=r)
-        self.context_conv = nn.Conv2d(channels, channels, kernel_size=k, padding=(k//2), bias=False)
-        self.upsample = nn.Upsample(scale_factor=r, mode='bilinear', align_corners=False)
-        self.conv_d = nn.Conv2d(channels, channels, kernel_size=k, padding=(k//2), bias=False)
-        self.conv_h = nn.Conv2d(channels, channels, kernel_size=k, padding=(k//2), bias=False)
-        self._init_identity()
+        padding = k // 2
+        
+        # Fd와 Fh를 위한 각각의 3x3 컨볼루션 
+        self.conv_d = nn.Conv2d(channels, channels, kernel_size=k, padding=padding, bias=False)
+        self.conv_h = nn.Conv2d(channels, channels, kernel_size=k, padding=padding, bias=False)
+        
+        # Attention Gate (f) 생성을 위한 경로 [cite: 213, 214, 215]
+        self.pool = nn.AvgPool2d(kernel_size=r, stride=r) if r > 1 else nn.Identity()
+        self.context_conv = nn.Conv2d(channels, channels, kernel_size=k, padding=padding, bias=False)
+        # self.upsample = nn.Upsample(scale_factor=r, mode='bilinear', align_corners=False) # F.interpolate 사용
+        self.r = r
 
-    def _init_identity(self):
-        # conv_h: identity (입력=출력 채널일 때 dirac 가능)
-        try:
-            init.dirac_(self.conv_h.weight)
-        except Exception:
-            init.kaiming_uniform_(self.conv_h.weight, a=math.sqrt(5))
-        if self.conv_h.bias is not None:
-            nn.init.zeros_(self.conv_h.bias)
+        self._init_weights()
 
-        # conv_d: 0으로 시작 → 초기엔 D 경로 영향 없음
-        nn.init.zeros_(self.conv_d.weight)
-        if self.conv_d.bias is not None:
-            nn.init.zeros_(self.conv_d.bias)
+    def _init_weights(self):
+        # 현재 코드의 AFM과 달리, conv_d를 0으로 초기화하면 안 됩니다.
+        # 일반적인 Kaiming 초기화를 사용합니다.
+        for m in [self.conv_d, self.conv_h, self.context_conv]:
+            init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
-        # context_conv: 0으로 시작 → 게이트 A가 과도하게 치우치지 않게
-        nn.init.zeros_(self.context_conv.weight)
-        if self.context_conv.bias is not None:
-            nn.init.zeros_(self.context_conv.bias)
-    
     def forward(self, Fh, Fd):
+        # Fh: Hazy features, Fd: Dehazed features (from FA)
         out_dtype = Fh.dtype
         if Fh.dtype != torch.float32 or Fd.dtype != torch.float32:
-            Fh = Fh.float(); Fd = Fd.float()
+            Fh = Fh.float()
+            Fd = Fd.float()
+            
         with amp.autocast(device_type="cuda", enabled=False):
-            X = Fd + Fh
-            context = self.context_conv(self.pool(X))
-            upsampled_context = F.interpolate(context, size=X.shape[2:], mode='bilinear', align_corners=False)
-            T = X + upsampled_context
-            A = torch.sigmoid(T)
-            Ff = self.conv_d(Fd) * A + self.conv_h(Fh) * (1.0 - A)
+            # 1. 수식 (2)에 따라 Attention Gate 'f' 계산 [cite: 216]
+            X = Fd + Fh  # [cite: 213]
+            
+            # Context 경로
+            if self.r > 1:
+                context = self.pool(X)
+                context = self.context_conv(context)
+                upsampled_context = F.interpolate(context, size=X.shape[2:], mode='bilinear', align_corners=False) # [cite: 214]
+            else:
+                upsampled_context = self.context_conv(X) # r=1이면 풀링/업샘플링 없음
+
+            T = X + upsampled_context  # Shortcut connection [cite: 215]
+            f = torch.sigmoid(T)       # Attention map 'f' [cite: 218]
+
+            # 2. 수식 (3)에 따라 최종 Fused Feature 'Ff' 계산 
+            out_d = self.conv_d(Fd)
+            out_h = self.conv_h(Fh)
+            
+            Ff = out_d * f + out_h * (1.0 - f)
+            
         return Ff.to(out_dtype)
 
 # ---------------------- FA (Table I) ----------------------

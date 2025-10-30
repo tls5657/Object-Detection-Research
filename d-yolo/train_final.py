@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import copy
 from contextlib import contextmanager
+from pathlib import Path
 
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.detect.val import DetectionValidator
@@ -30,6 +31,19 @@ COCO80_NAMES = [
     "toothbrush"
 ]
 
+def _save_core_when_best(trainer):
+    """Called on Ultralytics 'on_model_save'. Save D-YOLO core when best.pt updated."""
+    wdir = Path(trainer.save_dir) / "weights"
+    best_pt = wdir / "best.pt"
+    if not best_pt.exists():
+        return
+    # save only when best.pt is freshly updated
+    mtime = best_pt.stat().st_mtime
+    last = getattr(trainer, "_core_saved_mtime", None)
+    if last is None or mtime > last:
+        torch.save(trainer.core.state_dict(), wdir / "best_core.pth")
+        setattr(trainer, "_core_saved_mtime", mtime)
+        print(f"[CALLBACK] Saved D-YOLO core → {wdir/'best_core.pth'} (epoch={trainer.epoch})")
 
 def letterbox_np(img, new_shape, color=(114, 114, 114), scaleup=True):
     """Resize with aspect ratio, Ultralytics-style padding."""
@@ -687,7 +701,7 @@ def main():
     trainer.clear_train_path = CLEAR_TRAIN_PATH
     trainer.clear_val_path = CLEAR_VAL_PATH
     trainer.target_imgsz = (448, 640)
-
+    trainer.add_callback("on_model_save", _save_core_when_best)
     trainer.train()
 
 
