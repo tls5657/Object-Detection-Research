@@ -662,7 +662,7 @@ def main():
     BATCH_SIZE = 16
     
     # [수정 1] 해상도를 640 정수에서 [448, 640] 리스트로 변경
-    IMG_SIZE = [448, 640]  
+    IMG_SIZE = [448, 640]
     
     OPTIMIZER = 'SGD'
     LEARNING_RATE = 0.01
@@ -678,7 +678,6 @@ def main():
         "imgsz": IMG_SIZE,      # [448, 640]이 전달됨
         
         # [수정 2] 직사각형 훈련 및 검증 모드 활성화
-        "rect": True,           
         "conf": 0.001,
         "optimizer": OPTIMIZER,
         "lr0": LEARNING_RATE,
@@ -686,9 +685,9 @@ def main():
         "mosaic": MOSAIC,
         "cache": "disk",
         "compile": False,
-        "hsv_h": 0.0, "hsv_s": 0.0, "hsv_v": 0.0,
-        "fliplr": 0.0, "flipud": 0.0,
-        "degrees": 0.0, "scale": 0.0, "shear": 0.0, "translate": 0.0,
+        "hsv_h": 0.015, "hsv_s": 0.7, "hsv_v": 0.4,
+        "fliplr": 0.5, "flipud": 0.0,
+        "degrees": 0.0, "scale": 0.5, "shear": 0.0, "translate": 0.1,
         "workers": 8,
         "classes": [0, 1, 2, 3, 4],
     }
