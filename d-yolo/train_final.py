@@ -52,9 +52,9 @@ def _save_core_when_best(trainer):
     if last is None or mtime > last:
         torch.save(trainer.core.state_dict(), wdir / "best_core.pth")
         setattr(trainer, "_core_saved_mtime", mtime)
-        print(f"[CALLBACK] Saved D-YOLO core → {wdir/'best_core.pth'} (epoch={trainer.epoch})")
+        print(f"[CALLBACK] Saved D-YOLO core ??{wdir/'best_core.pth'} (epoch={trainer.epoch})")
 
-def letterbox_np(img, new_shape, color=(114, 114, 114), scaleup=True):
+def letterbox_np(img, new_shape, color=(114, 114, 114), scaleup=True, return_meta=False):
     """Resize with aspect ratio, Ultralytics-style padding."""
     h0, w0 = img.shape[:2]
     H, W = new_shape
@@ -63,10 +63,15 @@ def letterbox_np(img, new_shape, color=(114, 114, 114), scaleup=True):
         r = min(r, 1.0)
     new_unpad = (int(round(w0 * r)), int(round(h0 * r)))
     img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-    dw, dh = W - new_unpad[0], H - new_unpad[1]
-    top, bottom = dh // 2, dh - dh // 2
-    left, right = dw // 2, dw - dw // 2
+    dw = W - new_unpad[0]
+    dh = H - new_unpad[1]
+    dw /= 2
+    dh /= 2
+    left, right = int(np.floor(dw)), int(np.ceil(dw))
+    top, bottom = int(np.floor(dh)), int(np.ceil(dh))
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    if return_meta:
+        return img, r, (left, top)
     return img
 
 
@@ -167,7 +172,6 @@ class DYoloDetectWrapper(nn.Module):
 
     def forward(self, x, *args, **kwargs):
         if os.environ.get("DY_BYPASS_CORE", "0") == "1":
-            # 코어 완전 우회: 원래 Detect에 그대로 입력
             return self.detect(x, *args, **kwargs)
         if self.training:
             self.core.train()
@@ -204,12 +208,12 @@ class DYoloTrainer(DetectionTrainer):
         # Student backbone adapter
         self.student_bb = YOLOv8BackboneAdapter(self.det_model)
 
-        # --- FIX: 채널 프로브 해상도 하드 고정 ---
+        # --- FIX: 채널 ?�로�??�상???�드 고정 ---
         model_device = next(self.det_model.model.parameters()).device
         if hasattr(self, "target_imgsz"):
             img_h, img_w = self.target_imgsz  # e.g., (448, 640)
         else:
-            # 혹시 target_imgsz를 안 세팅했을 때만 기존 로직 사용(백업)
+            # ?�시 target_imgsz�????�팅?�을 ?�만 기존 로직 ?�용(백업)
             imgsz = self.args.imgsz
             if isinstance(imgsz, (tuple, list)):
                 img_h, img_w = (imgsz[0], imgsz[1]) if len(imgsz) >= 2 else (imgsz[0], imgsz[0])
@@ -389,17 +393,17 @@ class DYoloTrainer(DetectionTrainer):
         with torch.no_grad():
             hh, ww = (self.target_imgsz if hasattr(self, "target_imgsz") else (img_h, img_w))
             warm = torch.zeros(1, 3, hh, ww, device=model_device)
-            _ = self.det_model(warm)  # wrapper를 통과하며 Detect 내부 캐시/stride 재설정
+            _ = self.det_model(warm)  # wrapper�??�과?�며 Detect ?��? 캐시/stride ?�설??
         self.det_model.train()
-# --- [디버그 코드 ④] ---
-        print("\n--- [DEBUG ④] Head Sync Check ---")
+# --- [?�버�?코드 ?? ---
+        print("\n--- [DEBUG ?? Head Sync Check ---")
         d = self.base_detect
-        print(f"[DEBUG ④] detect.nc = {getattr(d,'nc',None)}")
-        print(f"[DEBUG ④] detect.no = {getattr(d,'no',None)}")
-        print(f"[DEBUG ④] head conv out channels = {[m.out_channels for m in getattr(d,'m',[])]}")
-        print(f"[DEBUG ④] model.names = {getattr(self.det_model, 'names', None)}")
-        print("--- [DEBUG ④] End Check ---\n")
-        # --- [디버그 코드 ④ 끝] ---
+        print(f"[DEBUG ?? detect.nc = {getattr(d,'nc',None)}")
+        print(f"[DEBUG ?? detect.no = {getattr(d,'no',None)}")
+        print(f"[DEBUG ?? head conv out channels = {[m.out_channels for m in getattr(d,'m',[])]}")
+        print(f"[DEBUG ?? model.names = {getattr(self.det_model, 'names', None)}")
+        print("--- [DEBUG ?? End Check ---\n")
+        # --- [?�버�?코드 ???? ---
         return m
 
     # ---------- dataset/build: force 5-class head sync ----------
@@ -408,8 +412,8 @@ class DYoloTrainer(DetectionTrainer):
 
         # determine active classes: if args.classes specified, use them (e.g., [0,1,2,3,5])
         active = getattr(self.args, "classes", None)
-        print(f"\n[DEBUG ③] Building dataset. Mode: {mode}")
-        print(f"[DEBUG ③] Active classes from args: {active}")
+        print(f"\n[DEBUG ?? Building dataset. Mode: {mode}")
+        print(f"[DEBUG ?? Active classes from args: {active}")
         if active is not None and len(active) > 0:
             active_nc = len(active)
             
@@ -421,9 +425,9 @@ class DYoloTrainer(DetectionTrainer):
                 active_names = [names_src[i] for i in active]
             else:
                 active_names = [str(i) for i in range(active_nc)]
-                print(f"[DEBUG ③] Dataset names BEFORE remap: {getattr(dset, 'names', 'N/A')}")
+                print(f"[DEBUG ?? Dataset names BEFORE remap: {getattr(dset, 'names', 'N/A')}")
             dset.names = list(active_names)
-            print(f"[DEBUG ③] Dataset names AFTER remap: {dset.names}\n")
+            print(f"[DEBUG ?? Dataset names AFTER remap: {dset.names}\n")
             # remap class ids to contiguous range 0..active_nc-1
             if hasattr(dset, "labels"):
                 for label in dset.labels:
@@ -468,7 +472,7 @@ class DYoloTrainer(DetectionTrainer):
 
         return dset
 
-    # ---------- validator with 448x640 & normalization ----------
+    # ---------- validator with custom img size & normalization ----------
     def get_validator(self):
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
         validator = DYoloValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks)
@@ -535,7 +539,7 @@ class DYoloTrainer(DetectionTrainer):
         W = max(getattr(self, "core_warmup_epochs", 3), 1)
         tau = min(1.0, (self.epoch + batch_progress) / W)
         self.core.tau = float(tau)
-        # 변경 (3 epoch 웜업, tau와 같은 아이디어)
+        # 변�?(3 epoch ?�업, tau?� 같�? ?�이?�어)
         Wl = max(getattr(self, "lambda_cwd_warmup_epochs", 3), 1)
         warm = min(1.0, (self.epoch + batch_progress) / Wl)
         lambda_dynamic = warm * self.lambda_cwd
@@ -571,8 +575,9 @@ class DYoloTrainer(DetectionTrainer):
             raise RuntimeError("Ultralytics batch has no file path list (im_file/paths).")
 
         imgs = batch["img"]
-        _, _, img_h, img_w = imgs.shape
         device = imgs.device
+        dtype = imgs.dtype
+        target_h, target_w = imgs.shape[2], imgs.shape[3]
 
         clear_imgs = []
         for f in im_files:
@@ -585,14 +590,13 @@ class DYoloTrainer(DetectionTrainer):
             clear_path = os.path.join(clear_root, base)
             if not os.path.exists(clear_path):
                 raise FileNotFoundError(f"Paired clear image not found: {clear_path}")
-            img = cv2.imread(clear_path, cv2.IMREAD_COLOR)
-            if img is None:
+            clear_img = cv2.imread(clear_path, cv2.IMREAD_COLOR)
+            if clear_img is None:
                 raise RuntimeError(f"Failed to read clear image: {clear_path}")
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = letterbox_np(img, (img_h, img_w))
-            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-            img = img.to(device=device, dtype=imgs.dtype)
-            clear_imgs.append(img)
+            clear_img = cv2.cvtColor(clear_img, cv2.COLOR_BGR2RGB)
+            clear_lb, _, _ = letterbox_np(clear_img, (target_h, target_w), return_meta=True)
+            clear_tensor = torch.from_numpy(clear_lb).permute(2, 0, 1).float() / 255.0
+            clear_imgs.append(clear_tensor.to(device=device, dtype=dtype))
 
         batch["img_clear"] = torch.stack(clear_imgs, dim=0)
         return batch
@@ -602,7 +606,7 @@ class DYoloValidator(DetectionValidator):
     def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None):
         super().__init__(dataloader, save_dir, args, _callbacks)
         self._val_printed = False
-        self.target_imgsz = (448, 640)
+        self.target_imgsz = (640, 640)
 
     def _peek_pred_stats(self, preds):
         # reg_out 추정
@@ -625,7 +629,7 @@ class DYoloValidator(DetectionValidator):
                               f"mean={cls_sig.mean().item():.4f}, shape={tuple(cls.shape)}")
 
     def postprocess(self, preds):
-        # 원시 로짓 상태 확인 (1회만)
+        # ?�시 로짓 ?�태 ?�인 (1?�만)
         if not self._val_printed:
             try:
                 self._peek_pred_stats(preds)
@@ -635,7 +639,7 @@ class DYoloValidator(DetectionValidator):
         outs = super().postprocess(preds)
 
         if not self._val_printed:
-            # 박스 개수 집계 (안전 처리)
+            # 박스 개수 집계 (?�전 처리)
             def count_boxes(p):
                 if hasattr(p, "shape"):
                     return int(p.shape[0])
@@ -663,15 +667,15 @@ class DYoloValidator(DetectionValidator):
 def main():
     # --- settings ---
     MODEL_CONFIG = 'yolov8n.yaml'
-    DATA_CONFIG = r'C:\Users\user\Desktop\dyolo\datasets\VOC-Foggy\voc-foggy.yaml'
-    CLEAR_TRAIN_PATH = r'C:\Users\user\Desktop\dyolo\datasets\VOC_Clear\images\train'
-    CLEAR_VAL_PATH   = r'C:\Users\user\Desktop\dyolo\datasets\VOC_Clear\images\val'
+    DATA_CONFIG = r'C:\Users\user\Desktop\dyolo\datasets\VOC-Foggy-448\voc-foggy-448.yaml'
+    CLEAR_TRAIN_PATH = r'C:\Users\user\Desktop\dyolo\datasets\VOC-Clear-448\images\train'
+    CLEAR_VAL_PATH   = r'C:\Users\user\Desktop\dyolo\datasets\VOC-Clear-448\images\val'
 
     EPOCHS = 100
     BATCH_SIZE = 16
     
-    # [수정 1] 해상도를 640 정수에서 [448, 640] 리스트로 변경
-    IMG_SIZE = [448, 640]  
+    # [?�정 1] ?�상?��? 640 ?�수?�서 [448, 640] 리스?�로 변�?
+    IMG_SIZE = 640
     
     OPTIMIZER = 'SGD'
     LEARNING_RATE = 0.01
@@ -684,9 +688,9 @@ def main():
         "data": DATA_CONFIG,
         "epochs": EPOCHS,
         "batch": BATCH_SIZE,
-        "imgsz": IMG_SIZE,      # [448, 640]이 전달됨
+        "imgsz": IMG_SIZE,
         
-        # [수정 2] 직사각형 훈련 및 검증 모드 활성화
+        # [?�정 2] 직사각형 ?�련 �?검�?모드 ?�성??
         "rect": True,           
         "conf": 0.001,
         "optimizer": OPTIMIZER,
@@ -708,7 +712,7 @@ def main():
     trainer.freeze_fa_epoch = 30
     trainer.clear_train_path = CLEAR_TRAIN_PATH
     trainer.clear_val_path = CLEAR_VAL_PATH
-    trainer.target_imgsz = (448, 640)
+    trainer.target_imgsz = (IMG_SIZE, IMG_SIZE)
     trainer.add_callback("on_model_save", _save_core_when_best)
     trainer.train()
 
