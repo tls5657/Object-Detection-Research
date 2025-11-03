@@ -10,6 +10,15 @@ from copy import copy
 from contextlib import contextmanager
 from pathlib import Path
 
+# Ensure legacy torch.load behaviour (weights_only=False) for PyTorch 2.6+
+os.environ.setdefault("TORCH_LOAD_WEIGHTS_ONLY", "0")
+
+from torch.serialization import add_safe_globals
+from torch.nn import Sequential, Conv2d, BatchNorm2d
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.modules.conv import Conv
+add_safe_globals([DetectionModel, Conv, Sequential, Conv2d, BatchNorm2d])
+
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.detect.val import DetectionValidator
 
@@ -580,7 +589,7 @@ class DYoloTrainer(DetectionTrainer):
             if img is None:
                 raise RuntimeError(f"Failed to read clear image: {clear_path}")
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+            img = letterbox_np(img, (img_h, img_w))
             img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
             img = img.to(device=device, dtype=imgs.dtype)
             clear_imgs.append(img)
@@ -662,7 +671,7 @@ def main():
     BATCH_SIZE = 16
     
     # [수정 1] 해상도를 640 정수에서 [448, 640] 리스트로 변경
-    IMG_SIZE = [448, 640]
+    IMG_SIZE = [448, 640]  
     
     OPTIMIZER = 'SGD'
     LEARNING_RATE = 0.01
@@ -678,16 +687,16 @@ def main():
         "imgsz": IMG_SIZE,      # [448, 640]이 전달됨
         
         # [수정 2] 직사각형 훈련 및 검증 모드 활성화
+        "rect": True,           
         "conf": 0.001,
         "optimizer": OPTIMIZER,
         "lr0": LEARNING_RATE,
         "cos_lr": COSINE_LR,
         "mosaic": MOSAIC,
         "cache": "disk",
-        "compile": False,
-        "hsv_h": 0.015, "hsv_s": 0.7, "hsv_v": 0.4,
-        "fliplr": 0.5, "flipud": 0.0,
-        "degrees": 0.0, "scale": 0.5, "shear": 0.0, "translate": 0.1,
+        "hsv_h": 0.0, "hsv_s": 0.0, "hsv_v": 0.0,
+        "fliplr": 0.0, "flipud": 0.0,
+        "degrees": 0.0, "scale": 0.0, "shear": 0.0, "translate": 0.0,
         "workers": 8,
         "classes": [0, 1, 2, 3, 4],
     }

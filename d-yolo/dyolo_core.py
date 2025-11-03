@@ -22,6 +22,8 @@ class DYOLOCore(nn.Module):
             self.cfe_proj3 = self._make_proj(256, C3)
             self.cfe_proj4 = self._make_proj(512, C4)
             self.cfe_proj5 = self._make_proj(1024, C5)
+            for p in self.cfe.parameters():
+                p.requires_grad_(False)
 
     @staticmethod
     def _make_proj(in_ch: int, out_ch: int) -> nn.Module:
@@ -40,3 +42,10 @@ class DYOLOCore(nn.Module):
             C3, C4, C5 = self.cfe(x_clear)                    # (256,512,1024)
         C3 = self.cfe_proj3(C3); C4 = self.cfe_proj4(C4); C5 = self.cfe_proj5(C5)  # -> (C3,C4,C5)
         return (C3, C4, C5)
+
+    def train(self, mode: bool = True):
+        """Keep the teacher (CFE) frozen regardless of the mode requested."""
+        super().train(mode)
+        if self.use_cfe:
+            self.cfe.eval()
+        return self
