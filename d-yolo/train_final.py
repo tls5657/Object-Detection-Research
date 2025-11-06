@@ -15,9 +15,9 @@ os.environ.setdefault("TORCH_LOAD_WEIGHTS_ONLY", "0")
 
 from torch.serialization import add_safe_globals
 from torch.nn import Sequential, Conv2d, BatchNorm2d
-from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.tasks import DetectionModel as U_DetectionModel
 from ultralytics.nn.modules.conv import Conv
-add_safe_globals([DetectionModel, Conv, Sequential, Conv2d, BatchNorm2d])
+add_safe_globals([U_DetectionModel, Conv, Sequential, Conv2d, BatchNorm2d])
 
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.detect.val import DetectionValidator
@@ -185,12 +185,7 @@ class DYoloDetectWrapper(nn.Module):
             D5 = self.core.fa5(H5)
             F3 = self.core.afm3(H3, D3)
             F4 = self.core.afm4(H4, D4)
-            F5 = self.core.afm5(H5, D5)
-            tau = float(getattr(self.core, "tau", 1.0))
-            if tau < 1.0:
-                F3 = H3 + tau * (F3 - H3)
-                F4 = H4 + tau * (F4 - H4)
-                F5 = H5 + tau * (F5 - H5)
+            F5 = self.core.afm5(H5, D5)        
             out = self.detect([F3, F4, F5], *args, **kwargs)
             if isinstance(out, (list, tuple)) and len(out) == 3 and not getattr(self, "_debug_shape_printed", False):
                 shapes = [tuple(o.shape) for o in out]
@@ -208,12 +203,10 @@ class DYoloTrainer(DetectionTrainer):
         # Student backbone adapter
         self.student_bb = YOLOv8BackboneAdapter(self.det_model)
 
-        # --- FIX: 채널 ?�로�??�상???�드 고정 ---
         model_device = next(self.det_model.model.parameters()).device
         if hasattr(self, "target_imgsz"):
             img_h, img_w = self.target_imgsz  # e.g., (448, 640)
         else:
-            # ?�시 target_imgsz�????�팅?�을 ?�만 기존 로직 ?�용(백업)
             imgsz = self.args.imgsz
             if isinstance(imgsz, (tuple, list)):
                 img_h, img_w = (imgsz[0], imgsz[1]) if len(imgsz) >= 2 else (imgsz[0], imgsz[0])
@@ -227,7 +220,6 @@ class DYoloTrainer(DetectionTrainer):
 
         # D-YOLO Core
         self.core = DYOLOCore(student_backbone=self.student_bb, chs=chs, use_cfe=True)
-        self.core.tau = 0.0
 
         # Wrap Detect
         detect_module = self.det_model.model[-1]
@@ -238,143 +230,167 @@ class DYoloTrainer(DetectionTrainer):
             wrapped_detect = detect_module
         self.base_detect = wrapped_detect.detect  # raw Detect
 
+
+# ======================================================================
+        # [신규] 80-Class COCO 모델을 가중치 소스로 임시 로드
+        # ======================================================================
+        model_device = next(self.det_model.model.parameters()).device
+        print("[HEAD FIX] Loading temporary 80-class COCO model to source head weights...")
+        try:
+            # cfg가 파일 경로일 수 있으므로, cfg가 None이 아니면 사용하고, 아니면 model.yaml 사용
+            cfg_path = cfg if cfg is not None else self.det_model.yaml_file
+            coco_model = U_DetectionModel(cfg_path, nc=80).to(model_device)
+            coco_model.load(weights, verbose=False) # 원본 .pt 가중치 로드
+            coco_detect = coco_model.model[-1] # 80-class Detect 헤드
+            print("[HEAD FIX] COCO model loaded successfully.")
+        except Exception as e:
+            print(f"CRITICAL: Failed to load 80-class COCO weights source model. {e}")
+            # coco_model 로드 실패 시, 헤드 가중치 복사 불가.
+            coco_detect = None 
+        # ======================================================================
         # --------- sync Detect head to 5-class layout ----------
 
-        active = getattr(self.args, "classes", None)  # expected [0,1,2,3,4]
+# --------- sync Detect head to 5-class layout ----------
+        active = getattr(self.args, "classes", None)
 
-        if active:
-
+        if active and coco_detect is not None: # [수정] coco_detect가 있을 때만 실행
             active_nc = len(active)
-
-            d = self.base_detect
-
+            d = self.base_detect # 5-class target detect module
             head_device = next(self.det_model.parameters()).device
-
             head_dtype = next(self.det_model.parameters()).dtype
-
             reg_max = getattr(d, "reg_max", 16)
-
             reg_out = reg_max * 4
-
+            
             d.nc = active_nc
-
             d.no = active_nc + reg_out
 
-
-
             target_names = ["person", "bicycle", "car", "motorcycle", "bus"]
-
             coco_name_to_idx = {name: idx for idx, name in enumerate(COCO80_NAMES)}
-
             selected_coco_ids = [coco_name_to_idx.get(name, 0) for name in target_names]
 
-
-
-            old_heads = list(getattr(d, "m", []))
-
-            new_heads = []
-
-            for old_conv in old_heads:
-
-                new_conv = nn.Conv2d(old_conv.in_channels, d.no, 1, bias=True)
-
-                with torch.no_grad():
-
-                    new_conv.weight.zero_()
-
-                    new_conv.bias.zero_()
-
-                    src_total = old_conv.weight.shape[0]
-
-                    reg_copy = min(reg_out, src_total)
-
-                    if reg_copy > 0:
-
-                        new_conv.weight[:reg_copy] = old_conv.weight[:reg_copy]
-
-                        new_conv.bias[:reg_copy] = old_conv.bias[:reg_copy]
-
-                    for new_cls_idx, coco_cls_idx in enumerate(selected_coco_ids):
-
-                        src_idx = reg_out + coco_cls_idx
-
-                        dst_idx = reg_out + new_cls_idx
-
-                        if 0 <= src_idx < src_total and dst_idx < new_conv.weight.shape[0]:
-
-                            new_conv.weight[dst_idx] = old_conv.weight[src_idx]
-
-                            new_conv.bias[dst_idx] = old_conv.bias[src_idx]
-
-                new_conv.to(device=head_device, dtype=head_dtype)
-
-                new_heads.append(new_conv)
-
-            if new_heads:
-
-                d.m = nn.ModuleList(new_heads)
-
-
-
-            if hasattr(d, "cv3"):
-
-                for seq in d.cv3:
-
-                    if not (isinstance(seq, nn.Sequential) and len(seq) > 0):
-
-                        continue
-
-                    last = seq[-1]
-
-                    if not isinstance(last, nn.Conv2d):
-
-                        continue
-
-                    if last.out_channels == active_nc:
-
-                        continue
-
-                    new_cls_conv = nn.Conv2d(last.in_channels, active_nc, kernel_size=1, bias=last.bias is not None)
-
+# ======================================================================
+            # [신규] cv2 (Box Regression) 가중치 수동 복사
+            # ======================================================================
+            if hasattr(d, "cv2") and isinstance(d.cv2, nn.ModuleList) and \
+               hasattr(coco_detect, "cv2") and isinstance(coco_detect.cv2, nn.ModuleList) and \
+               len(d.cv2) == len(coco_detect.cv2):
+                
+                print("[HEAD FIX] Manually copying cv2 (Box) weights...")
+                try:
                     with torch.no_grad():
+                        for i in range(len(d.cv2)):
+                            # cv2는 채널 수가 동일하므로 state_dict()로 전체 복사
+                            d.cv2[i].load_state_dict(coco_detect.cv2[i].state_dict())
+                    print("[HEAD FIX] cv2 weights copied successfully.")
+                except Exception as e:
+                    print(f"[HEAD FIX WARNING] Failed to copy cv2 weights: {e}")
+            else:
+                print("[HEAD FIX WARNING] cv2 (Box) head mismatch or not found. Skipping weight copy.")
+            # ======================================================================
+# ======================================================================
+            # [신규 추가] dfl.conv (Distribution Focal Loss) 가중치 수동 복사
+            # (이 블록을 cv2와 cv3 로직 사이에 추가하세요. L340 근처)
+            # ======================================================================
+            if hasattr(d, "dfl") and isinstance(getattr(d, "dfl", None), nn.Module) and \
+               hasattr(coco_detect, "dfl") and isinstance(getattr(coco_detect, "dfl", None), nn.Module):
+                
+                print("[HEAD FIX] Manually copying dfl.conv weights...")
+                try:
+                    # d.dfl.conv와 coco_detect.dfl.conv는 state_dict() 구조가 동일함
+                    with torch.no_grad():
+                        # DFL 모듈 내부의 'conv' 레이어 가중치를 복사
+                        d.dfl.conv.load_state_dict(coco_detect.dfl.conv.state_dict())
+                    print("[HEAD FIX] dfl.conv weights copied successfully.")
+                except Exception as e:
+                    print(f"[HEAD FIX WARNING] Failed to copy dfl.conv weights: {e}")
+            else:
+                print("[HEAD FIX WARNING] dfl.conv module not found. Skipping weight copy.")
+            # ======================================================================
+# ======================================================================
+            # [수정] cv3 (Class) 가중치 복사 로직 (아래 코드로 전체 교체)
+            # ======================================================================
+            if hasattr(d, "cv3") and isinstance(d.cv3, nn.ModuleList):
+                print("[HEAD FIX] Rebuilding cv3 (Class) modules to match COCO structure...")
+                try:
+                    for i in range(len(d.cv3)): # i = 0, 1, 2 (각 레벨)
+                        coco_seq = coco_detect.cv3[i] # 80-class Sequential, e.g., Conv(64,80), Conv(80,80), Conv(80,80)
+                        target_seq = d.cv3[i]       # 5-class Sequential, e.g., Conv(64,64), Conv(64,64), Conv(64,5)
+                        
+                        if not (isinstance(coco_seq, nn.Sequential) and isinstance(target_seq, nn.Sequential) and len(coco_seq) == 3 and len(target_seq) == 3):
+                            raise ValueError(f"Sequential structure mismatch at index {i}")
 
-                        new_cls_conv.weight.zero_()
+                        # 1. 새 Conv0 생성 (e.g., Conv(64, 80))
+                        #    COCO 모델(coco_seq[0])의 가중치를 복사합니다.
+                        c_in = target_seq[0].conv.in_channels   # 5-class 모델의 입력 채널 (e.g., 64)
+                        c_mid = coco_seq[0].conv.out_channels # 80-class 모델의 중간 채널 (e.g., 80)
+                        
+                        # Ultralytics의 Conv 블록 타입(Conv)을 사용하여 재생성
+                        new_conv0 = type(target_seq[0])( 
+                            c_in, 
+                            c_mid, 
+                            k=target_seq[0].conv.kernel_size[0],
+                            s=target_seq[0].conv.stride[0]
+                        ).to(head_device, head_dtype)
+                        new_conv0.load_state_dict(coco_seq[0].state_dict()) # 가중치 복사
 
-                        if new_cls_conv.bias is not None:
+                        # 2. 새 Conv1 생성 (e.g., Conv(80, 80))
+                        #    COCO 모델(coco_seq[1])의 가중치를 복사합니다.
+                        new_conv1 = type(target_seq[1])(
+                            c_mid,
+                            c_mid,
+                            k=target_seq[1].conv.kernel_size[0],
+                            s=target_seq[1].conv.stride[0]
+                        ).to(head_device, head_dtype)
+                        new_conv1.load_state_dict(coco_seq[1].state_dict()) # 가중치 복사
 
-                            new_cls_conv.bias.zero_()
+                        # 3. 새 Conv2 (최종 1x1 Conv) 생성 (e.g., Conv(80, 5))
+                        coco_conv_final = coco_seq[-1] # 원본: nn.Conv2d(80, 80, 1)
+                        
+                        new_conv_final = nn.Conv2d(
+                            in_channels=c_mid,      # 80
+                            out_channels=active_nc, # 5
+                            kernel_size=1,
+                            stride=1,
+                            padding=0,
+                            bias=(coco_conv_final.bias is not None)
+                        ).to(head_device, head_dtype)
 
-                        src_total = last.weight.shape[0]
+                        # 80-class -> 5-class 가중치 선별 복사
+                        with torch.no_grad():
+                            new_conv_final.weight.zero_()
+                            if new_conv_final.bias is not None:
+                                new_conv_final.bias.zero_()
+                            
+                            for new_cls_idx, coco_cls_idx in enumerate(selected_coco_ids):
+                                if 0 <= coco_cls_idx < coco_conv_final.weight.shape[0]: # 80
+                                    # coco_conv_final.weight[idx]의 shape는 [in_channels, 1, 1] (e.g., [80, 1, 1])
+                                    # new_conv_final.weight[idx]의 shape도 [in_channels, 1, 1] (e.g., [80, 1, 1])
+                                    # in_channels(c_mid)가 80으로 동일하므로 복사 가능
+                                    new_conv_final.weight[new_cls_idx] = coco_conv_final.weight[coco_cls_idx]
+                                    if new_conv_final.bias is not None and coco_conv_final.bias is not None:
+                                        new_conv_final.bias[new_cls_idx] = coco_conv_final.bias[coco_cls_idx]
 
-                        for new_cls_idx, coco_cls_idx in enumerate(selected_coco_ids):
+                        # 4. d.cv3[i]의 Sequential 블록 전체를 새 블록으로 교체
+                        d.cv3[i] = nn.Sequential(new_conv0, new_conv1, new_conv_final).to(head_device, head_dtype)
+                        
+                except Exception as e:
+                    print(f"[HEAD FIX CRITICAL] Failed to rebuild cv3 modules. Weights may be random. Error: {e}")
+                    import traceback
+                    traceback.print_exc()
 
-                            if 0 <= coco_cls_idx < src_total:
-
-                                new_cls_conv.weight[new_cls_idx] = last.weight[coco_cls_idx]
-
-                                if new_cls_conv.bias is not None and last.bias is not None:
-
-                                    new_cls_conv.bias[new_cls_idx] = last.bias[coco_cls_idx]
-
-                    new_cls_conv.to(device=head_device, dtype=head_dtype)
-
-                    seq[-1] = new_cls_conv
-
-            if hasattr(d, "initialize_biases"):
-
-                d.initialize_biases()
-
-
-
+                print("[HEAD FIX] cv3 modules successfully rebuilt and weights re-mapped.")
+            # ======================================================================
+            # [수정 완료]
+            # ======================================================================
+            # 모델 이름 업데이트
             if hasattr(self.det_model, "names"):
-
                 self.det_model.names = target_names
-
             if hasattr(self, "model") and isinstance(getattr(self, "model"), nn.Module):
-
                 self.model.names = target_names
-
+            
             print(f"[SYNC@build] Detect nc={d.nc}, no={d.no}, names={target_names}")
+        elif coco_detect is None:
+            print("[HEAD FIX ERROR] COCO source model failed to load. Head weights are random.")
         # update adapter references
         self.student_bb.layers = self.det_model.model
         self.student_bb.detect = self.det_model.model[-1]
@@ -386,8 +402,8 @@ class DYoloTrainer(DetectionTrainer):
         # custom hypers
         self.lambda_cwd = getattr(self, "lambda_cwd", 1.0)
         self.lambda_cwd_start = 0.0
-        self.gradient_balance_gamma = getattr(self, "gradient_balance_gamma", 0.05)
         self.freeze_fa_epoch = getattr(self, "freeze_fa_epoch", 30)
+        self.gradient_balance_gamma = getattr(self, "gradient_balance_gamma", 0.05)
         # --- warmup after head surgery (recalibrate detect caches/stride) ---
         self.det_model.eval()
         with torch.no_grad():
@@ -395,15 +411,21 @@ class DYoloTrainer(DetectionTrainer):
             warm = torch.zeros(1, 3, hh, ww, device=model_device)
             _ = self.det_model(warm)  # wrapper�??�과?�며 Detect ?��? 캐시/stride ?�설??
         self.det_model.train()
-# --- [?�버�?코드 ?? ---
+# --- [디버깅 코드 수정] ---
         print("\n--- [DEBUG ?? Head Sync Check ---")
         d = self.base_detect
         print(f"[DEBUG ?? detect.nc = {getattr(d,'nc',None)}")
         print(f"[DEBUG ?? detect.no = {getattr(d,'no',None)}")
-        print(f"[DEBUG ?? head conv out channels = {[m.out_channels for m in getattr(d,'m',[])]}")
+        
+        # [수정] d.m 대신 d.cv2와 d.cv3의 채널을 직접 확인합니다.
+        cv2_ch = [seq[-1].out_channels for seq in getattr(d, 'cv2', []) if isinstance(seq, nn.Sequential)]
+        cv3_ch = [seq[-1].out_channels for seq in getattr(d, 'cv3', []) if isinstance(seq, nn.Sequential)]
+        print(f"[DEBUG ?? detect.cv2 (Box) out channels = {cv2_ch}")
+        print(f"[DEBUG ?? detect.cv3 (Cls) out channels = {cv3_ch}")
+        
         print(f"[DEBUG ?? model.names = {getattr(self.det_model, 'names', None)}")
         print("--- [DEBUG ?? End Check ---\n")
-        # --- [?�버�?코드 ???? ---
+# --- [디버깅 코드 수정 완료] ---
         return m
 
     # ---------- dataset/build: force 5-class head sync ----------
@@ -416,18 +438,26 @@ class DYoloTrainer(DetectionTrainer):
         print(f"[DEBUG ?? Active classes from args: {active}")
         if active is not None and len(active) > 0:
             active_nc = len(active)
-            
             id_map = {int(orig): idx for idx, orig in enumerate(active)}
-            names_src = getattr(dset, "names", None)
-            if isinstance(names_src, dict):
-                active_names = [names_src[i] for i in active]
-            elif isinstance(names_src, (list, tuple)):
-                active_names = [names_src[i] for i in active]
+# ======== [ 핵심 수정 ] ========
+            # get_model과 동일한, 하드코딩된 타겟 이름을 사용합니다.
+            target_names = ["person", "bicycle", "car", "motorcycle", "bus"]
+            
+            if active_nc == 5:
+                dset.names = target_names
+                print(f"[DEBUG ?? Dataset names FORCED to: {dset.names}\n")
             else:
-                active_names = [str(i) for i in range(active_nc)]
-                print(f"[DEBUG ?? Dataset names BEFORE remap: {getattr(dset, 'names', 'N/A')}")
-            dset.names = list(active_names)
-            print(f"[DEBUG ?? Dataset names AFTER remap: {dset.names}\n")
+                # (예외 처리) 5개 클래스가 아닌 경우에만 기존 로직 사용
+                names_src = getattr(dset, "names", None)
+                if isinstance(names_src, dict):
+                    active_names = [names_src[i] for i in active]
+                elif isinstance(names_src, (list, tuple)):
+                    active_names = [names_src[i] for i in active]
+                else:
+                    active_names = [str(i) for i in range(active_nc)]
+                dset.names = list(active_names)
+                print(f"[DEBUG ?? Dataset names (Fallback): {dset.names}\n")
+            # ======== [ 수정 완료 ] ========
             # remap class ids to contiguous range 0..active_nc-1
             if hasattr(dset, "labels"):
                 for label in dset.labels:
@@ -452,24 +482,6 @@ class DYoloTrainer(DetectionTrainer):
                 active_names = list(nm)
             else:
                 active_names = [str(i) for i in range(active_nc)]
-
-        # # sync Detect head to active_nc
-        # d = self.base_detect  # raw Detect
-        # if getattr(d, "nc", None) != active_nc:
-        #     d.nc = active_nc
-        #     d.no = active_nc + getattr(d, "reg_max", 0) * 4
-        #     if hasattr(d, "m"):
-        #         d.m = nn.ModuleList(
-        #             [nn.Conv2d(conv.in_channels, d.no, kernel_size=1, bias=True) for conv in d.m]
-        #         )
-        #         if hasattr(d, "initialize_biases"):
-        #             d.initialize_biases()
-        # update names for metrics
-
-        # # one-time print (sanity)
-        # if not getattr(self, "_printed_nc", False):
-        #     self._printed_nc = True
-
         return dset
 
     # ---------- validator with custom img size & normalization ----------
@@ -512,53 +524,80 @@ class DYoloTrainer(DetectionTrainer):
     def _yolo_detect(self, F3, F4, F5):
         return self.base_detect([F3, F4, F5])
 
+# [최종 수정] dyolo/train.py의 train_step 함수 전체를 이 코드로 교체하세요.
+
     # ---------- train step ----------
     def train_step(self, batch):
         device = self.device
-        imgs = batch["img"].to(device, non_blocking=True)
-        imgs_clear = batch.get("img_clear", imgs).to(device, non_blocking=True)
+        imgs = batch['img'].to(device, non_blocking=True)
+        imgs_clear = batch.get('img_clear', imgs).to(device, non_blocking=True)
 
         # freeze at epoch
         if self.epoch == self.freeze_fa_epoch:
             self.set_fa_trainable(False)
-            current_lr = self.optimizer.param_groups[0]["lr"] if hasattr(self, "optimizer") else self.args.lr0
+            current_lr = self.optimizer.param_groups[0]['lr'] if hasattr(self, 'optimizer') else self.args.lr0
             self.optimizer = self.build_optimizer(self.model, name=self.args.optimizer, lr=current_lr)
 
-        # student pathway
-        (H3, H4, H5), (D3, D4, D5), (F3, F4, F5) = self.core.forward_student(imgs)
-        preds = self._yolo_detect(F3, F4, F5)
+        # [수정 1] with torch.amp.autocast 블록을 if문 밖으로 꺼내어 들여쓰기를 수정합니다.
+        with torch.amp.autocast('cuda', enabled=False):
+            imgs_fp32 = imgs.float()
+            imgs_clear_fp32 = imgs_clear.float()
 
-        det_loss, loss_items = self.criterion(preds, batch)
+            # student pathway
+            (H3, H4, H5), (D3, D4, D5), (F3, F4, F5) = self.core.forward_student(imgs_fp32)
+            
+            # [수정 2] nb와 batch_progress를 여기서 한 번만 정의합니다.
+            nb = max(getattr(self, 'nb', 1), 1)
+            batch_progress = (getattr(self, 'batch_i', 0) + 1) / nb
 
-        # teacher + CWD
-        C3, C4, C5 = self.core.forward_teacher(imgs_clear)
-        cwd_loss = self.cwd([C3, C4, C5], [D3, D4, D5])
+            # [수정 5] 블렌딩된 피처로 preds를 계산합니다.
+            preds = self._yolo_detect(F3, F4, F5)
+            det_loss, loss_items = self.criterion(preds, batch)
 
-        nb = max(getattr(self, "nb", 1), 1)
-        batch_progress = (getattr(self, "batch_i", 0) + 1) / nb
-        W = max(getattr(self, "core_warmup_epochs", 3), 1)
-        tau = min(1.0, (self.epoch + batch_progress) / W)
-        self.core.tau = float(tau)
-        # 변�?(3 epoch ?�업, tau?� 같�? ?�이?�어)
-        Wl = max(getattr(self, "lambda_cwd_warmup_epochs", 3), 1)
-        warm = min(1.0, (self.epoch + batch_progress) / Wl)
-        lambda_dynamic = warm * self.lambda_cwd
+            # [수정 6] D-YOLO 논문 전략에 따라 30 에포크 기준으로 손실 계산을 분리합니다.
+            if self.epoch < self.freeze_fa_epoch:
+                # --- Epoch 0-29: FA 모듈 훈련 ---
+                
+                # 1. CWD Loss 계산
+                C3, C4, C5 = self.core.forward_teacher(imgs_clear_fp32)
+                cwd_loss = self.cwd([C3, C4, C5], [D3, D4, D5]) # D 피처 사용
 
-        def _grad_norm(loss_term, tensors):
-            grads = torch.autograd.grad(loss_term, tensors, retain_graph=True, allow_unused=True, create_graph=True)
-            grads = [g for g in grads if g is not None]
-            if not grads:
-                return torch.zeros((), device=loss_term.device, dtype=loss_term.dtype, requires_grad=True)
-            norm_sq = sum(g.pow(2).sum() for g in grads)
-            eps = loss_term.new_tensor(1e-12)
-            return torch.sqrt(norm_sq + eps)
+                # 2. CWD 웜업
+                warm_epochs = max(getattr(self, 'lambda_cwd_warmup_epochs', 3), 1)
+                progress = min(1.0, (self.epoch + batch_progress) / warm_epochs)
+                beta_cwd = float(progress) * self.lambda_cwd 
+                self.current_lambda_cwd = beta_cwd 
 
-        det_grad_norm = _grad_norm(det_loss, [D3, D4, D5])
-        cwd_grad_norm = _grad_norm(cwd_loss, [D3, D4, D5])
-        grad_penalty = self.gradient_balance_gamma * torch.abs(det_grad_norm - cwd_grad_norm)
+                # 3. Grad Penalty 계산
+                def _grad_norm(loss_term, tensors):
+                    grads = torch.autograd.grad(loss_term, tensors, retain_graph=True, allow_unused=True, create_graph=True)
+                    grads = [g for g in grads if g is not None]
+                    if not grads:
+                        return torch.zeros((), device=loss_term.device, dtype=loss_term.dtype, requires_grad=True)
+                    norm_sq = sum(g.pow(2).sum() for g in grads)
+                    eps = loss_term.new_tensor(1e-12)
+                    return torch.sqrt(norm_sq + eps)
 
-        self.current_lambda_cwd = float(lambda_dynamic)
-        total_loss = det_loss + lambda_dynamic * cwd_loss + grad_penalty
+                # [수정] 그래디언트 계산 기준을 D가 아닌 F로 변경합니다 (det_loss가 F에 의존)
+                #det_grad_norm = _grad_norm(det_loss, [F3, F4, F5]) 
+                cwd_grad_norm = _grad_norm(cwd_loss, [D3, D4, D5]) # cwd_loss는 D에 의존
+                
+                # [수정] Grad Penalty 수식 수정 (D-YOLO 논문 Eq. 10)
+                # D에 대한 det_loss 그래디언트와 cwd_loss 그래디언트의 밸런스를 맞춰야 합니다.
+                # det_loss는 F를 통해 D에 의존합니다. (det_loss -> F -> D)
+                det_grad_norm_on_D = _grad_norm(det_loss, [D3, D4, D5])
+                
+                grad_penalty = self.gradient_balance_gamma * torch.abs(det_grad_norm_on_D - cwd_grad_norm)
+
+# 4. 최종 손실 (Stage 1)
+                total_loss = det_loss + (beta_cwd * cwd_loss) + grad_penalty
+            
+            else:
+                # --- Epoch 30+: FA 모듈 동결 ---
+                # 오직 det_loss로만 훈련합니다.
+                total_loss = det_loss
+                self.current_lambda_cwd = 0.0 # 로깅을 위해 0으로 설정
+
         return total_loss, loss_items
 
     # ---------- teacher clear image injection ----------
@@ -606,7 +645,7 @@ class DYoloValidator(DetectionValidator):
     def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None):
         super().__init__(dataloader, save_dir, args, _callbacks)
         self._val_printed = False
-        self.target_imgsz = (640, 640)
+        self.target_imgsz = (448, 640)
 
     def _peek_pred_stats(self, preds):
         # reg_out 추정
@@ -667,6 +706,8 @@ class DYoloValidator(DetectionValidator):
 def main():
     # --- settings ---
     MODEL_CONFIG = 'yolov8n.yaml'
+    
+    # [수정 1] 전처리된 448x640 데이터셋 경로로 변경
     DATA_CONFIG = r'C:\Users\user\Desktop\dyolo\datasets\VOC-Foggy-448\voc-foggy-448.yaml'
     CLEAR_TRAIN_PATH = r'C:\Users\user\Desktop\dyolo\datasets\VOC-Clear-448\images\train'
     CLEAR_VAL_PATH   = r'C:\Users\user\Desktop\dyolo\datasets\VOC-Clear-448\images\val'
@@ -674,8 +715,8 @@ def main():
     EPOCHS = 100
     BATCH_SIZE = 16
     
-    # [?�정 1] ?�상?��? 640 ?�수?�서 [448, 640] 리스?�로 변�?
-    IMG_SIZE = 640
+    # [수정 2] imgsz는 가장 긴 변인 640 (정수)로 설정
+    IMG_SIZE = [448, 640]
     
     OPTIMIZER = 'SGD'
     LEARNING_RATE = 0.01
@@ -685,22 +726,29 @@ def main():
     # overrides
     yolo_overrides = {
         "model": "yolov8n.pt",
-        "data": DATA_CONFIG,
+        "data": DATA_CONFIG,     # [수정 1] 반영
         "epochs": EPOCHS,
         "batch": BATCH_SIZE,
-        "imgsz": IMG_SIZE,
+        "imgsz": IMG_SIZE,       # [수정 2] 반영 (640 정수)
         
-        # [?�정 2] 직사각형 ?�련 �?검�?모드 ?�성??
-        "rect": True,           
+        # [확인] rect=True는 직사각형 학습에 필수
+        "rect": True,
+        "amp": True,
         "conf": 0.001,
         "optimizer": OPTIMIZER,
         "lr0": LEARNING_RATE,
         "cos_lr": COSINE_LR,
         "mosaic": MOSAIC,
         "cache": "disk",
-        "hsv_h": 0.0, "hsv_s": 0.0, "hsv_v": 0.0,
-        "fliplr": 0.0, "flipud": 0.0,
-        "degrees": 0.0, "scale": 0.0, "shear": 0.0, "translate": 0.0,
+        "hsv_h": 0.015,
+        "hsv_s": 0.7,
+        "hsv_v": 0.4,
+        "fliplr": 0.5,
+        "flipud": 0.0,
+        "degrees": 0.0,
+        "scale": 0.5,
+        "shear": 0.0,
+        "translate": 0.1,
         "workers": 8,
         "classes": [0, 1, 2, 3, 4],
     }
@@ -712,7 +760,11 @@ def main():
     trainer.freeze_fa_epoch = 30
     trainer.clear_train_path = CLEAR_TRAIN_PATH
     trainer.clear_val_path = CLEAR_VAL_PATH
-    trainer.target_imgsz = (IMG_SIZE, IMG_SIZE)
+    
+    # [수정 3] 모델 빌드 기준 해상도를 (H, W) 튜플로 하드코딩
+    #          (IMG_SIZE, IMG_SIZE)가 아닌 (448, 640)으로 수정
+    trainer.target_imgsz = (448, 640)
+    
     trainer.add_callback("on_model_save", _save_core_when_best)
     trainer.train()
 

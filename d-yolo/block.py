@@ -48,34 +48,45 @@ class ODConv1x1(nn.Module):
 
 # [수정] block.py의 AFM 클래스를 아래 코드로 전체 교체
 # ---------------------- AFM (Paper Fig.5 & Eq.(3)) ----------------------
+# [수정] block.py의 AFM 클래스를 아래 코드로 전체 교체
+# ---------------------- AFM (Paper Fig.5 & Eq.(3)) ----------------------
 class AFM(nn.Module):
     """
     D-YOLO 논문의 Attention Feature Fusion (AFM) 구현 (Fig. 5)
-    Ff = f_conv1(Fd) * Sig(T) + f_conv2(Fh) * (1 - Sig(T))
+
+    [수정된 로직]
+    1. Ff = Fd * f + Fh * (1 - f)
+       - 원본 Fd와 Fh를 어텐션 맵으로 직접 퓨전합니다.
+       - (기존의 conv_d, conv_h는 사전 학습된 Detect 헤드와 호환되지 않음)
+    2. Attention (f)가 0에서 시작하도록 context_conv의 bias를 음수로 초기화합니다.
+       - f=0 이면, Epoch 0에서 Ff = Fh가 되어 안정적으로 학습이 시작됩니다.
     """
     def __init__(self, channels, r=4, k=3):
         super().__init__()
         padding = k // 2
         
-        # Fd와 Fh를 위한 각각의 3x3 컨볼루션 
-        self.conv_d = nn.Conv2d(channels, channels, kernel_size=k, padding=padding, bias=False)
-        self.conv_h = nn.Conv2d(channels, channels, kernel_size=k, padding=padding, bias=False)
+        # Fd와 Fh를 위한 각각의 3x3 컨볼루션 -> [제거]
+        # self.conv_d = nn.Conv2d(...)
+        # self.conv_h = nn.Conv2d(...)
         
-        # Attention Gate (f) 생성을 위한 경로 [cite: 213, 214, 215]
+        # Attention Gate (f) 생성을 위한 경로
         self.pool = nn.AvgPool2d(kernel_size=r, stride=r) if r > 1 else nn.Identity()
-        self.context_conv = nn.Conv2d(channels, channels, kernel_size=k, padding=padding, bias=False)
-        # self.upsample = nn.Upsample(scale_factor=r, mode='bilinear', align_corners=False) # F.interpolate 사용
+        
+        # [수정] bias=True로 변경
+        self.context_conv = nn.Conv2d(channels, channels, kernel_size=k, padding=padding, bias=True)
         self.r = r
 
         self._init_weights()
 
     def _init_weights(self):
-        # 현재 코드의 AFM과 달리, conv_d를 0으로 초기화하면 안 됩니다.
-        # 일반적인 Kaiming 초기화를 사용합니다.
-        for m in [self.conv_d, self.conv_h, self.context_conv]:
-            init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+        # [수정] conv_d, conv_h 제거
+        # for m in [self.conv_d, self.conv_h, self.context_conv]:
+        
+        # context_conv의 가중치는 Kaiming, bias는 음수로 초기화
+        init.kaiming_uniform_(self.context_conv.weight, a=math.sqrt(5))
+        if self.context_conv.bias is not None:
+            # T = (Fh+Fd) + context_bias. T가 음수가 되어야 f=sigmoid(T)가 0에 가까워짐
+            nn.init.constant_(self.context_conv.bias, -10.0) 
 
     def forward(self, Fh, Fd):
         # Fh: Hazy features, Fd: Dehazed features (from FA)
@@ -85,28 +96,29 @@ class AFM(nn.Module):
             Fd = Fd.float()
             
         with amp.autocast(device_type="cuda", enabled=False):
-            # 1. 수식 (2)에 따라 Attention Gate 'f' 계산 [cite: 216]
-            X = Fd + Fh  # [cite: 213]
+            # 1. 수식 (2)에 따라 Attention Gate 'f' 계산
+            X = Fd + Fh  #
             
             # Context 경로
             if self.r > 1:
                 context = self.pool(X)
                 context = self.context_conv(context)
-                upsampled_context = F.interpolate(context, size=X.shape[2:], mode='bilinear', align_corners=False) # [cite: 214]
+                upsampled_context = F.interpolate(context, size=X.shape[2:], mode='bilinear', align_corners=False) #
             else:
                 upsampled_context = self.context_conv(X) # r=1이면 풀링/업샘플링 없음
 
-            T = X + upsampled_context  # Shortcut connection [cite: 215]
-            f = torch.sigmoid(T)       # Attention map 'f' [cite: 218]
+            T = X + upsampled_context  # Shortcut connection
+            f = torch.sigmoid(T)       # Attention map 'f' (초기값 0에 가까움)
 
-            # 2. 수식 (3)에 따라 최종 Fused Feature 'Ff' 계산 
-            out_d = self.conv_d(Fd)
-            out_h = self.conv_h(Fh)
+            # 2. [수정] 수식 (3)에 따라 최종 Fused Feature 'Ff' 계산
+            # out_d = self.conv_d(Fd) -> [제거]
+            # out_h = self.conv_h(Fh) -> [제거]
             
-            Ff = out_d * f + out_h * (1.0 - f)
+            # Ff = Fd * f + Fh * (1.0 - f)
+            # Epoch 0: Ff = 0 * 0 + Fh * (1.0 - 0) = Fh
+            Ff = Fd * f + Fh * (1.0 - f)
             
         return Ff.to(out_dtype)
-
 # ---------------------- FA (Table I) ----------------------
 class ChannelAttention(nn.Module):
     def __init__(self, ch, reduction=16):

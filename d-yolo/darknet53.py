@@ -1,155 +1,148 @@
 import torch
 import torch.nn as nn
 from ultralytics import YOLO
+from ultralytics.nn.tasks import BaseModel # YOLOv8 모델 기본 클래스
 
 # ==============================================================================
-# 1. Darknet-53의 기본 부품 정의 (수정 없음)
+# 1. "완벽한" CFE Teacher 모델 (래퍼 클래스 설계)
+#    (YOLOv3u 백본을 직접 사용하여, C3/C4/C5 출력을 위해 forward를 커스터마이징)
 # ==============================================================================
 
-def conv_bn_lrelu(in_ch, out_ch, k=1, s=1, p=None, bias=False):
-    """컨볼루션 + 배치 정규화 + LeakyReLU 활성화 함수를 하나로 묶은 기본 블록"""
-    if p is None:
-        p = (k - 1) // 2
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, k, s, p, bias=bias),
-        nn.BatchNorm2d(out_ch),
-        nn.LeakyReLU(0.1, inplace=True)
-    )
-
-class Residual(nn.Module):
-    """잔차 연결(Residual Connection)을 구현한 블록"""
-    def __init__(self, ch):
+class CFE_Backbone(nn.Module):
+    """
+    D-YOLO 논문 CFE(Clear Feature Extraction)를 "완벽하게" 구현.
+    
+    - '다크넷'으로 불리는 백본을 학습한다. (e.g., class Darknet53)
+    - Ultralytics의 사전 학습된 YOLOv3u 백본 모듈 객체를 가져옵니다.
+    - D-YOLO가 요구하는 C3, C4, C5 피처맵을 반환하도록
+      forward 메서드만 D-YOLO에 맞게 커스터마이징합니다.
+    
+    ** 이 방식은 가중치 이름 등을 긁어와서 매핑 로직 없이 100% 정확한 가중치를 보장합니다.
+    """
+    def __init__(self, pretrained_backbone_module: nn.Sequential):
         super().__init__()
-        self.conv1 = conv_bn_lrelu(ch, ch // 2, k=1)
-        self.conv2 = conv_bn_lrelu(ch // 2, ch, k=3)
+        
+        # 1. Ultralytics의 'yolov3u.pt' 백본 모듈(nn.Sequential)을 그대로 가져옵니다.
+        #    이 모듈은 0번부터 10번까지의 레이어로 구성됩니다.
+        self.backbone = pretrained_backbone_module
+        
+        # 2. D-YOLO 논문에서 요구하는 출력은 YOLOv3 백본의
+        #    C3 (Stride 8), C4 (Stride 16), C5 (Stride 32) 입니다.
+        #    yolov3[u].yaml 파일을 따르면 이 레이어들은
+        #    각각 6, 8, 10 인덱스에 해당합니다.
+        self.c3_idx = 6
+        self.c4_idx = 8
+        self.c5_idx = 10
+        
+        # 3. 이 모듈은 CFE (Teacher)로써 학습 중에 가중치가
+        #    변경되지 않도록 모든 파라미터를 동결(freeze)시킵니다.
+        #    D-YOLO 논문에 따라 CFE는 추론에만 사용됩니다.
+        for param in self.backbone.parameters():
+            param.requires_grad = False
 
-    def forward(self, x):
-        return x + self.conv2(self.conv1(x))
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """D-YOLO CFE에 맞게 C3, C4, C5를 반환합니다."""
+        
+        # C3, C4, C5 출력을 저장할 변수
+        c3_out, c4_out, c5_out = None, None, None
+        
+        # 0번부터 C5(10번) 레이어까지 순차적으로 실행
+        # (참고: self.backbone은 nn.Sequential 또는 nn.ModuleList입니다)
+        for i, layer in enumerate(self.backbone):
+            x = layer(x)
+            
+            #
+            # [원리] YOLOv5/v8의 'save' 리스트와 동일한 로직입니다.
+            # yolov3.yaml에서 neck) 부분이 C3, C4, C5를 참조합니다.
+            # (예시: [[-1, 1, nn.Upsample, [None, 2, 'nearest']],
+            #        [[-1, 8], 1, Concat, [1]],  # <- 8번 레이어 즉 C4를 참조
+            #
+            
+            if i == self.c3_idx:
+                c3_out = x
+            elif i == self.c4_idx:
+                c4_out = x
+            elif i == self.c5_idx:
+                c5_out = x
+                break # C5(10번)까지만 계산하고 더 이상 필요 없음
+        
+        return c3_out, c4_out, c5_out
 
 # ==============================================================================
-# 2. Darknet-53의 전체 구조 정의 (설계도) (수정 없음)
+# 2. "완벽한" CFE 생성 함수 (팩토리 함수 설계)
+#    (가중치를 따로 매핑하는 복잡한 로직 없이 백본 모듈을 직접 가져옴)
 # ==============================================================================
 
-class Darknet53(nn.Module):
+def create_teacher_model() -> CFE_Backbone:
     """
-    D-YOLO 논문에서 요구하는 C3, C4, C5 특징 맵을 반환하는
-    최소한의 Darknet-53 백본 아키텍처.
-    """
-    def __init__(self, in_ch=3):
-        super().__init__()
-        # 각 스테이지의 블록 반복 횟수: [1, 2, 8, 8, 4]
-        self.conv1 = conv_bn_lrelu(in_ch, 32, 3, 1)
-        self.conv2 = conv_bn_lrelu(32, 64, 3, 2)
-        self.res1 = self._make_residual(64, 1)
-
-        self.conv3 = conv_bn_lrelu(64, 128, 3, 2)
-        self.res2 = self._make_residual(128, 2)
-
-        self.conv4 = conv_bn_lrelu(128, 256, 3, 2) # -> stride 8
-        self.res3 = self._make_residual(256, 8)
-
-        self.conv5 = conv_bn_lrelu(256, 512, 3, 2) # -> stride 16
-        self.res4 = self._make_residual(512, 8)
-
-        self.conv6 = conv_bn_lrelu(512, 1024, 3, 2) # -> stride 32
-        self.res5 = self._make_residual(1024, 4)
-
-    def _make_residual(self, ch, n):
-        return nn.Sequential(*[Residual(ch) for _ in range(n)])
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x); x = self.res1(x)
-        x = self.conv3(x); x = self.res2(x)
-
-        x = self.conv4(x); x = self.res3(x)
-        C3 = x  # stride 8 출력
-
-        x = self.conv5(x); x = self.res4(x)
-        C4 = x  # stride 16 출력
-
-        x = self.conv6(x); x = self.res5(x)
-        C5 = x  # stride 32 출력
-
-        return C3, C4, C5
-
-# ==============================================================================
-# 3. 사전 학습된 가중치를 로드하는 함수 정의 (최종 수정된 부분)
-# ==============================================================================
-
-def create_teacher_model():
-    """
-    1. Darknet-53의 '빈 집'(구조)을 짓습니다.
-    2. ultralytics 라이브러리를 통해 사전 학습된 YOLOv3 모델을 로드합니다.
-    3. YOLOv3 백본의 가중치 '이름표'를 우리 구조에 맞게 변환하여 채워 넣습니다.
+    1. Ultralytics에서 YOLOv3u 모델을 로드합니다.
+    2. 모델의 백본(backbone) 부분(model.model[0])을 추출합니다.
+    3. 이 백본 모듈을 CFE_Backbone 래퍼(wrapper) 클래스에 전달하여
+       가중치가 100% 일치하는 CFE 모델을 생성합니다.
     """
     print("Creating Darknet-53 teacher model (CFE)...")
     
-    # 1. 먼저, 우리가 위에서 정의한 '설계도'로 텅 빈 Darknet-53 모델을 만듭니다.
-    teacher_model = Darknet53()
-    
     try:
-        # 2. ultralytics 라이브러리로 사전 학습된 YOLOv3 모델 전체를 로드합니다.
-        print("Loading pre-trained YOLOv3 model via ultralytics library...")
-        yolov3_full_model = YOLO('yolov3.pt')
-        print("YOLOv3 model loaded successfully.")
+        print("Loading pre-trained YOLOv3u model via ultralytics library...")
+        # 1. Ultralytics 라이브러리로 사전 학습된 YOLOv3u 모델 객체를 로드합니다.
+        #    'yolov3.pt'를 사용해도 무방합니다.
+        yolov3_full_model = YOLO('yolov3u.pt')
+        print("YOLOv3u model loaded successfully.")
 
-        # 3. 로드된 YOLOv3 모델에서 백본(Darknet-53) 부분의 가중치(state_dict)를 추출합니다.
-        pretrained_backbone = yolov3_full_model.model.model[0]
+        # 2. YOLOv3u 모델의 '백본' 모듈을 추출합니다.
+        #    yolov3_full_model.model은 BaseModel 인스턴스입니다.
+        #    yolov3_full_model.model.model은 백본+헤드 Sequential입니다.
+        #    yolov3_full_model.model.model[0]이 우리가 찾는 '백본'입니다.
         
-        # 4. 이름표가 다른 두 모델의 가중치를 순서대로 매핑하여 로드합니다.
-        #    이것이 이름 불일치 문제를 해결하는 가장 확실한 방법입니다.
-        
-        # 4-1. 우리 모델(빈 집)의 state_dict를 가져옵니다.
-        model_state_dict = teacher_model.state_dict()
-        # 4-2. 다운로드한 모델(가구 세트)의 state_dict를 가져옵니다.
-        pretrained_state_dict = pretrained_backbone.state_dict()
+        if isinstance(yolov3_full_model.model, BaseModel):
+            # Ultralytics 모델의 모델 리스트에서 0번부터 10번까지 (총 11개) 레이어가 백본입니다.
+            modules = list(yolov3_full_model.model.model.children())
+            backbone_layers = modules[:11]  # 0~10 backbone layers
+            pretrained_backbone_module = nn.Sequential(*backbone_layers)
+        else:
+            raise AttributeError('Could not find backbone modules in the loaded YOLOv3u model.')
 
-        # 4-3. 우리 모델의 '방 이름'과 다운로드한 모델의 '가구'를 순서대로 짝짓습니다.
-        new_state_dict = {model_key: pretrained_value 
-                          for (model_key, model_value), (pretrained_key, pretrained_value) 
-                          in zip(model_state_dict.items(), pretrained_state_dict.items())
-                          if model_value.shape == pretrained_value.shape} # 크기가 같은 경우에만 매칭
-
-        # 4-4. 이름표가 완벽하게 일치하는 새로운 가중치 딕셔너리로 모델을 업데이트합니다.
-        model_state_dict.update(new_state_dict)
+        teacher_model = CFE_Backbone(pretrained_backbone_module)
         
-        # 5. 최종적으로 모델에 가중치를 로드합니다.
-        teacher_model.load_state_dict(model_state_dict)
-        print("Pre-trained weights successfully remapped and loaded into Darknet-53 structure!")
+        print("Successfully wrapped YOLOv3u backbone as CFE Teacher.")
         
     except Exception as e:
         print(f"Error loading pre-trained weights: {e}")
-        print("Proceeding with randomly initialized teacher model. Note: CWD loss may not be effective.")
+        print("Could not create CFE teacher model. Returning None.")
+        return None # 실패 시 None 반환
 
     return teacher_model
 
-
 # ==============================================================================
-# 4. 최종 테스트 실행 (수정 없음)
+# 3. 최종 테스트 실행 (검증 코드)
 # ==============================================================================
 
 if __name__ == '__main__':
-    # 이 파일이 잘 작동하는지 최종적으로 테스트합니다.
-    
-    # 1. 사전 학습된 가중치가 적용된 선생님 모델을 생성합니다.
+    # 1. 사전 학습된 가중치가 적용된 선생 모델을 생성합니다.
     cfe_teacher = create_teacher_model()
     
-    # 모델을 평가 모드로 설정합니다 (학습하지 않음).
-    cfe_teacher.eval()
-    
-    # 2. 테스트용 가짜 이미지를 만듭니다.
-    #    (배치 크기 1, 3채널, 416x416 크기)
-    dummy_image = torch.randn(1, 3, 416, 416)
-    
-    # 3. 모델이 정상적으로 C3, C4, C5를 출력하는지 테스트합니다.
-    with torch.no_grad():
-        C3_feat, C4_feat, C5_feat = cfe_teacher(dummy_image)
-    
-    # 4. 출력된 특징 맵들의 크기를 출력하여 모든 과정이 성공했음을 확인합니다.
-    print("\n--- CFE Teacher Model Test Passed ---")
-    print(f"Input image shape: {dummy_image.shape}")
-    print(f"Output C3 (stride 8) shape: {C3_feat.shape}")
-    print(f"Output C4 (stride 16) shape: {C4_feat.shape}")
-    print(f"Output C5 (stride 32) shape: {C5_feat.shape}")
-
+    if cfe_teacher:
+        # 모델을 평가 모드로 설정합니다. (가중치 동결 확인)
+        cfe_teacher.eval()
+        
+        # 2. 테스트용 가짜 이미지를 만듭니다.
+        #    (D-YOLO 논문 예시처럼 448(H) x 640(W)로 테스트)
+        dummy_image = torch.randn(1, 3, 448, 640)
+        
+        # 3. 모델에 이미지를 넣어 C3, C4, C5를 출력하는지 테스트합니다.
+        with torch.no_grad(): # no_grad()가 없어도 동결되었는지 확인
+            C3_feat, C4_feat, C5_feat = cfe_teacher(dummy_image)
+        
+        # 4. 출력된 피처 맵들의 크기를 출력하여 모든 과정이 성공했음을 확인합니다.
+        print("\n--- CFE Teacher Model Test Passed ---")
+        print(f"Input image shape: {dummy_image.shape}")
+        # (448/8, 640/8) = (56, 80)
+        print(f"Output C3 (stride 8) shape: {C3_feat.shape}") 
+        # (448/16, 640/16) = (28, 40)
+        print(f"Output C4 (stride 16) shape: {C4_feat.shape}") 
+        # (448/32, 640/32) = (14, 20)
+        print(f"Output C5 (stride 32) shape: {C5_feat.shape}")
+        
+        # 가중치가 동결되었는지 확인
+        is_frozen = all(not p.requires_grad for p in cfe_teacher.parameters())
+        print(f"All parameters frozen: {is_frozen}")
